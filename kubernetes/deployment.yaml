@@ -1,10 +1,13 @@
-apiVersion: extensions/v1beta1
+apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: cost-model
   labels:
     app: cost-model
 spec:
+  selector:
+    matchLabels:
+      app: cost-model
   replicas: 1
   strategy:
     rollingUpdate:
@@ -27,7 +30,7 @@ spec:
               memory: "55M"
           env:
             - name: PROMETHEUS_SERVER_ENDPOINT
-              value: "{{prometheusEndpoint}}"  #The endpoint should have the form http://<service-name>.<namespace-name>.svc
+              value: "http://prometheus.monitoring.svc.cluster.local:9090"  #The endpoint should have the form http://<service-name>.<namespace-name>.svc.cluster.local 
             - name: CLOUD_PROVIDER_API_KEY
               value: "AIzaSyD29bGxmHAVEOBYtgd8sYM2gM2ekfxQX4U" # The GCP Pricing API requires a key.
           imagePullPolicy: Always
