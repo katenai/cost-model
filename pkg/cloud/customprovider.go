@@ -8,6 +8,8 @@ import (
 	"sync"
 
 	"github.com/kubecost/cost-model/pkg/clustercache"
+	"github.com/kubecost/cost-model/pkg/env"
+
 	v1 "k8s.io/api/core/v1"
 )
 
@@ -105,7 +107,12 @@ func (cp *CustomProvider) ClusterInfo() (map[string]string, error) {
 		m["name"] = conf.ClusterName
 	}
 	m["provider"] = "custom"
+	m["id"] = env.GetClusterID()
 	return m, nil
+}
+
+func (*CustomProvider) GetAddresses() ([]byte, error) {
+	return nil, nil
 }
 
 func (*CustomProvider) GetDisks() ([]byte, error) {
@@ -173,7 +180,7 @@ func (cp *CustomProvider) DownloadPricingData() error {
 	return nil
 }
 
-func (cp *CustomProvider) GetKey(labels map[string]string) Key {
+func (cp *CustomProvider) GetKey(labels map[string]string, n *v1.Node) Key {
 	return &customProviderKey{
 		SpotLabel:      cp.SpotLabel,
 		SpotLabelValue: cp.SpotLabelValue,
@@ -254,4 +261,14 @@ func (cpk *customProviderKey) Features() string {
 		return "default,spot"
 	}
 	return "default" // TODO: multiple custom pricing support.
+}
+
+func (cp *CustomProvider) ServiceAccountStatus() *ServiceAccountStatus {
+	return &ServiceAccountStatus{
+		Checks: []*ServiceAccountCheck{},
+	}
+}
+
+func (cp *CustomProvider) CombinedDiscountForNode(instanceType string, isPreemptible bool, defaultDiscount, negotiatedDiscount float64) float64 {
+	return 1.0 - ((1.0 - defaultDiscount) * (1.0 - negotiatedDiscount))
 }

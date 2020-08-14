@@ -19,10 +19,15 @@ import (
 	"k8s.io/klog"
 
 	"github.com/kubecost/cost-model/pkg/clustercache"
+	"github.com/kubecost/cost-model/pkg/env"
+	"github.com/kubecost/cost-model/pkg/errors"
+	"github.com/kubecost/cost-model/pkg/log"
 	"github.com/kubecost/cost-model/pkg/util"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
+	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/athena"
 	"github.com/aws/aws-sdk-go/service/ec2"
@@ -33,37 +38,73 @@ import (
 	v1 "k8s.io/api/core/v1"
 )
 
-const awsAccessKeyIDEnvVar = "AWS_ACCESS_KEY_ID"
-const awsAccessKeySecretEnvVar = "AWS_SECRET_ACCESS_KEY"
 const awsReservedInstancePricePerHour = 0.0287
 const supportedSpotFeedVersion = "1"
 const SpotInfoUpdateType = "spotinfo"
 const AthenaInfoUpdateType = "athenainfo"
 
+// How often spot data is refreshed
+const SpotRefreshDuration = 15 * time.Minute
+
+const defaultConfigPath = "/var/configs/"
+
+var awsRegions = []string{
+	"us-east-2",
+	"us-east-1",
+	"us-west-1",
+	"us-west-2",
+	"ap-east-1",
+	"ap-south-1",
+	"ap-northeast-3",
+	"ap-northeast-2",
+	"ap-southeast-1",
+	"ap-southeast-2",
+	"ap-northeast-1",
+	"ca-central-1",
+	"cn-north-1",
+	"cn-northwest-1",
+	"eu-central-1",
+	"eu-west-1",
+	"eu-west-2",
+	"eu-west-3",
+	"eu-north-1",
+	"me-south-1",
+	"sa-east-1",
+	"us-gov-east-1",
+	"us-gov-west-1",
+}
+
 // AWS represents an Amazon Provider
 type AWS struct {
-	Pricing                 map[string]*AWSProductTerms
-	SpotPricingByInstanceID map[string]*spotInfo
-	RIPricingByInstanceID   map[string]*RIData
-	RIDataRunning           bool
-	RIDataLock              sync.RWMutex
-	ValidPricingKeys        map[string]bool
-	Clientset               clustercache.ClusterCache
-	BaseCPUPrice            string
-	BaseRAMPrice            string
-	BaseGPUPrice            string
-	BaseSpotCPUPrice        string
-	BaseSpotRAMPrice        string
-	SpotLabelName           string
-	SpotLabelValue          string
-	ServiceKeyName          string
-	ServiceKeySecret        string
-	SpotDataRegion          string
-	SpotDataBucket          string
-	SpotDataPrefix          string
-	ProjectID               string
-	DownloadPricingDataLock sync.RWMutex
-	Config                  *ProviderConfig
+	Pricing                     map[string]*AWSProductTerms
+	SpotPricingByInstanceID     map[string]*spotInfo
+	SpotPricingUpdatedAt        *time.Time
+	SpotRefreshRunning          bool
+	SpotPricingLock             sync.RWMutex
+	RIPricingByInstanceID       map[string]*RIData
+	RIDataRunning               bool
+	RIDataLock                  sync.RWMutex
+	SavingsPlanDataByInstanceID map[string]*SavingsPlanData
+	SavingsPlanDataRunning      bool
+	SavingsPlanDataLock         sync.RWMutex
+	ValidPricingKeys            map[string]bool
+	Clientset                   clustercache.ClusterCache
+	BaseCPUPrice                string
+	BaseRAMPrice                string
+	BaseGPUPrice                string
+	BaseSpotCPUPrice            string
+	BaseSpotRAMPrice            string
+	SpotLabelName               string
+	SpotLabelValue              string
+	ServiceKeyName              string
+	ServiceKeySecret            string
+	SpotDataRegion              string
+	SpotDataBucket              string
+	SpotDataPrefix              string
+	ProjectID                   string
+	DownloadPricingDataLock     sync.RWMutex
+	Config                      *ProviderConfig
+	ServiceAccountChecks        map[string]*ServiceAccountCheck
 	*CustomProvider
 }
 
@@ -248,6 +289,7 @@ type AwsAthenaInfo struct {
 	ServiceKeyName   string `json:"serviceKeyName"`
 	ServiceKeySecret string `json:"serviceKeySecret"`
 	AccountID        string `json:"projectID"`
+	MasterPayerARN   string `json:"masterPayerARN"`
 }
 
 func (aws *AWS) GetManagementPlatform() (string, error) {
@@ -294,7 +336,9 @@ func (aws *AWS) UpdateConfig(r io.Reader, updateType string) (*CustomPricing, er
 			}
 
 			c.ServiceKeyName = a.ServiceKeyName
-			c.ServiceKeySecret = a.ServiceKeySecret
+			if a.ServiceKeySecret != "" {
+				c.ServiceKeySecret = a.ServiceKeySecret
+			}
 			c.SpotDataPrefix = a.Prefix
 			c.SpotDataBucket = a.BucketName
 			c.ProjectID = a.AccountID
@@ -313,7 +357,12 @@ func (aws *AWS) UpdateConfig(r io.Reader, updateType string) (*CustomPricing, er
 			c.AthenaDatabase = a.AthenaDatabase
 			c.AthenaTable = a.AthenaTable
 			c.ServiceKeyName = a.ServiceKeyName
-			c.ServiceKeySecret = a.ServiceKeySecret
+			if a.ServiceKeySecret != "" {
+				c.ServiceKeySecret = a.ServiceKeySecret
+			}
+			if a.MasterPayerARN != "" {
+				c.MasterPayerARN = a.MasterPayerARN
+			}
 			c.AthenaProjectID = a.AccountID
 		} else {
 			a := make(map[string]interface{})
@@ -340,14 +389,12 @@ func (aws *AWS) UpdateConfig(r io.Reader, updateType string) (*CustomPricing, er
 			}
 		}
 
-		remoteEnabled := os.Getenv(remoteEnabled)
-		if remoteEnabled == "true" {
-			err := UpdateClusterMeta(os.Getenv(clusterIDKey), c.ClusterName)
+		if env.IsRemoteEnabled() {
+			err := UpdateClusterMeta(env.GetClusterID(), c.ClusterName)
 			if err != nil {
 				return err
 			}
 		}
-
 		return nil
 	})
 }
@@ -447,7 +494,7 @@ func (key *awsPVKey) Features() string {
 }
 
 // GetKey maps node labels to information needed to retrieve pricing data
-func (aws *AWS) GetKey(labels map[string]string) Key {
+func (aws *AWS) GetKey(labels map[string]string, n *v1.Node) Key {
 	return &awsKey{
 		SpotLabelName:  aws.SpotLabelName,
 		SpotLabelValue: aws.SpotLabelValue,
@@ -468,6 +515,9 @@ func (aws *AWS) isPreemptible(key string) bool {
 func (aws *AWS) DownloadPricingData() error {
 	aws.DownloadPricingDataLock.Lock()
 	defer aws.DownloadPricingDataLock.Unlock()
+	if aws.ServiceAccountChecks == nil {
+		aws.ServiceAccountChecks = make(map[string]*ServiceAccountCheck)
+	}
 	c, err := aws.Config.GetCustomPricingData()
 	if err != nil {
 		klog.V(1).Infof("Error downloading default pricing data: %s", err.Error())
@@ -496,7 +546,7 @@ func (aws *AWS) DownloadPricingData() error {
 	inputkeys := make(map[string]bool)
 	for _, n := range nodeList {
 		labels := n.GetObjectMeta().GetLabels()
-		key := aws.GetKey(labels)
+		key := aws.GetKey(labels, n)
 		inputkeys[key.Features()] = true
 	}
 
@@ -523,19 +573,43 @@ func (aws *AWS) DownloadPricingData() error {
 		key := aws.GetPVKey(pv, params, "")
 		pvkeys[key.Features()] = key
 	}
+
+	// RIDataRunning establishes the existance of the goroutine. Since it's possible we
+	// run multiple downloads, we don't want to create multiple go routines if one already exists
 	if !aws.RIDataRunning && c.AthenaBucketName != "" {
 		err = aws.GetReservationDataFromAthena() // Block until one run has completed.
 		if err != nil {
 			klog.V(1).Infof("Failed to lookup reserved instance data: %s", err.Error())
 		} else { // If we make one successful run, check on new reservation data every hour
 			go func() {
+				defer errors.HandlePanic()
+				aws.RIDataRunning = true
+
 				for {
-					aws.RIDataRunning = true
 					klog.Infof("Reserved Instance watcher running... next update in 1h")
 					time.Sleep(time.Hour)
 					err := aws.GetReservationDataFromAthena()
 					if err != nil {
 						klog.Infof("Error updating RI data: %s", err.Error())
+					}
+				}
+			}()
+		}
+	}
+	if !aws.SavingsPlanDataRunning && c.AthenaBucketName != "" {
+		err = aws.GetSavingsPlanDataFromAthena()
+		if err != nil {
+			klog.V(1).Infof("Failed to lookup savings plan data: %s", err.Error())
+		} else {
+			go func() {
+				defer errors.HandlePanic()
+				aws.SavingsPlanDataRunning = true
+				for {
+					klog.Infof("Savings Plan watcher running... next update in 1h")
+					time.Sleep(time.Hour)
+					err := aws.GetSavingsPlanDataFromAthena()
+					if err != nil {
+						klog.Infof("Error updating Savings Plan data: %s", err.Error())
 					}
 				}
 			}()
@@ -689,14 +763,50 @@ func (aws *AWS) DownloadPricingData() error {
 		}
 	}
 
-	sp, err := parseSpotData(aws.SpotDataBucket, aws.SpotDataPrefix, aws.ProjectID, aws.SpotDataRegion, aws.ServiceKeyName, aws.ServiceKeySecret)
-	if err != nil {
-		klog.V(1).Infof("Skipping AWS spot data download: %s", err.Error())
-	} else {
-		aws.SpotPricingByInstanceID = sp
+	// Always run spot pricing refresh when performing download
+	aws.refreshSpotPricing(true)
+
+	// Only start a single refresh goroutine
+	if !aws.SpotRefreshRunning {
+		aws.SpotRefreshRunning = true
+
+		go func() {
+			defer errors.HandlePanic()
+
+			for {
+				klog.Infof("Spot Pricing Refresh scheduled in %.2f minutes.", SpotRefreshDuration.Minutes())
+				time.Sleep(SpotRefreshDuration)
+
+				// Reoccurring refresh checks update times
+				aws.refreshSpotPricing(false)
+			}
+		}()
 	}
 
 	return nil
+}
+
+func (aws *AWS) refreshSpotPricing(force bool) {
+	aws.SpotPricingLock.Lock()
+	defer aws.SpotPricingLock.Unlock()
+
+	now := time.Now().UTC()
+	updateTime := now.Add(-SpotRefreshDuration)
+
+	// Return if there was an update time set and an hour hasn't elapsed
+	if !force && aws.SpotPricingUpdatedAt != nil && aws.SpotPricingUpdatedAt.After(updateTime) {
+		return
+	}
+
+	sp, err := aws.parseSpotData(aws.SpotDataBucket, aws.SpotDataPrefix, aws.ProjectID, aws.SpotDataRegion, aws.ServiceKeyName, aws.ServiceKeySecret)
+	if err != nil {
+		klog.V(1).Infof("Skipping AWS spot data download: %s", err.Error())
+		return
+	}
+
+	// update time last updated
+	aws.SpotPricingUpdatedAt = &now
+	aws.SpotPricingByInstanceID = sp
 }
 
 // Stubbed NetworkPricing for AWS. Pull directly from aws.json for now
@@ -732,31 +842,55 @@ func (aws *AWS) AllNodePricing() (interface{}, error) {
 	return aws.Pricing, nil
 }
 
-func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k Key) (*Node, error) {
-	key := k.Features()
+func (aws *AWS) spotPricing(instanceID string) (*spotInfo, bool) {
+	aws.SpotPricingLock.RLock()
+	defer aws.SpotPricingLock.RUnlock()
+
+	info, ok := aws.SpotPricingByInstanceID[instanceID]
+	return info, ok
+}
+
+func (aws *AWS) reservedInstancePricing(instanceID string) (*RIData, bool) {
 	aws.RIDataLock.RLock()
 	defer aws.RIDataLock.RUnlock()
-	if aws.isPreemptible(key) {
-		if spotInfo, ok := aws.SpotPricingByInstanceID[k.ID()]; ok { // try and match directly to an ID for pricing. We'll still need the features
-			var spotcost string
-			arr := strings.Split(spotInfo.Charge, " ")
-			if len(arr) == 2 {
-				spotcost = arr[0]
-			} else {
-				klog.V(2).Infof("Spot data for node %s is missing", k.ID())
-			}
-			return &Node{
-				Cost:         spotcost,
-				VCPU:         terms.VCpu,
-				RAM:          terms.Memory,
-				GPU:          terms.GPU,
-				Storage:      terms.Storage,
-				BaseCPUPrice: aws.BaseCPUPrice,
-				BaseRAMPrice: aws.BaseRAMPrice,
-				BaseGPUPrice: aws.BaseGPUPrice,
-				UsageType:    usageType,
-			}, nil
+
+	data, ok := aws.RIPricingByInstanceID[instanceID]
+	return data, ok
+}
+
+func (aws *AWS) savingsPlanPricing(instanceID string) (*SavingsPlanData, bool) {
+	aws.SavingsPlanDataLock.RLock()
+	defer aws.SavingsPlanDataLock.RUnlock()
+
+	data, ok := aws.SavingsPlanDataByInstanceID[instanceID]
+	return data, ok
+}
+
+func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k Key) (*Node, error) {
+	key := k.Features()
+
+	if spotInfo, ok := aws.spotPricing(k.ID()); ok {
+		var spotcost string
+		klog.V(3).Infof("Looking up spot data from feed for node %s", k.ID())
+		arr := strings.Split(spotInfo.Charge, " ")
+		if len(arr) == 2 {
+			spotcost = arr[0]
+		} else {
+			klog.V(2).Infof("Spot data for node %s is missing", k.ID())
 		}
+		return &Node{
+			Cost:         spotcost,
+			VCPU:         terms.VCpu,
+			RAM:          terms.Memory,
+			GPU:          terms.GPU,
+			Storage:      terms.Storage,
+			BaseCPUPrice: aws.BaseCPUPrice,
+			BaseRAMPrice: aws.BaseRAMPrice,
+			BaseGPUPrice: aws.BaseGPUPrice,
+			UsageType:    usageType,
+		}, nil
+	} else if aws.isPreemptible(key) { // Preemptible but we don't have any data in the pricing report.
+		klog.Infof("Node %s marked preemitible but we have no data in spot feed", k.ID())
 		return &Node{
 			VCPU:         terms.VCpu,
 			VCPUCost:     aws.BaseSpotCPUPrice,
@@ -769,7 +903,21 @@ func (aws *AWS) createNode(terms *AWSProductTerms, usageType string, k Key) (*No
 			BaseGPUPrice: aws.BaseGPUPrice,
 			UsageType:    usageType,
 		}, nil
-	} else if ri, ok := aws.RIPricingByInstanceID[k.ID()]; ok {
+	} else if sp, ok := aws.savingsPlanPricing(k.ID()); ok {
+		strCost := fmt.Sprintf("%f", sp.EffectiveCost)
+		return &Node{
+			Cost:         strCost,
+			VCPU:         terms.VCpu,
+			RAM:          terms.Memory,
+			GPU:          terms.GPU,
+			Storage:      terms.Storage,
+			BaseCPUPrice: aws.BaseCPUPrice,
+			BaseRAMPrice: aws.BaseRAMPrice,
+			BaseGPUPrice: aws.BaseGPUPrice,
+			UsageType:    usageType,
+		}, nil
+
+	} else if ri, ok := aws.reservedInstancePricing(k.ID()); ok {
 		strCost := fmt.Sprintf("%f", ri.EffectiveCost)
 		return &Node{
 			Cost:         strCost,
@@ -863,17 +1011,13 @@ func (awsProvider *AWS) ClusterInfo() (map[string]string, error) {
 		return nil, err
 	}
 
-	remote := os.Getenv(remoteEnabled)
-	remoteEnabled := false
-	if os.Getenv(remote) == "true" {
-		remoteEnabled = true
-	}
+	remoteEnabled := env.IsRemoteEnabled()
 
 	if c.ClusterName != "" {
 		m := make(map[string]string)
 		m["name"] = c.ClusterName
 		m["provider"] = "AWS"
-		m["id"] = os.Getenv(clusterIDKey)
+		m["id"] = env.GetClusterID()
 		m["remoteReadEnabled"] = strconv.FormatBool(remoteEnabled)
 		return m, nil
 	}
@@ -882,12 +1026,12 @@ func (awsProvider *AWS) ClusterInfo() (map[string]string, error) {
 		m := make(map[string]string)
 		m["name"] = clusterName
 		m["provider"] = "AWS"
-		m["id"] = os.Getenv(clusterIDKey)
+		m["id"] = env.GetClusterID()
 		m["remoteReadEnabled"] = strconv.FormatBool(remoteEnabled)
 		return m, nil
 	}
 
-	maybeClusterId := os.Getenv(ClusterIdEnvVar)
+	maybeClusterId := env.GetAWSClusterID()
 	if len(maybeClusterId) != 0 {
 		return makeStructure(maybeClusterId)
 	}
@@ -946,25 +1090,48 @@ func (awsProvider *AWS) ClusterInfo() (map[string]string, error) {
 			}
 		}
 	}*/
-	klog.V(2).Infof("Unable to sniff out cluster ID, perhaps set $%s to force one", ClusterIdEnvVar)
+	klog.V(2).Infof("Unable to sniff out cluster ID, perhaps set $%s to force one", env.AWSClusterIDEnvVar)
 	return makeStructure(defaultClusterName)
 }
 
 // Gets the aws key id and secret
 func (aws *AWS) getAWSAuth(forceReload bool, cp *CustomPricing) (string, string) {
+	if aws.ServiceAccountChecks == nil { // safety in case checks don't exist
+		aws.ServiceAccountChecks = make(map[string]*ServiceAccountCheck)
+	}
+
 	// 1. Check config values first (set from frontend UI)
 	if cp.ServiceKeyName != "" && cp.ServiceKeySecret != "" {
+		aws.ServiceAccountChecks["hasKey"] = &ServiceAccountCheck{
+			Message: "AWS ServiceKey exists",
+			Status:  true,
+		}
 		return cp.ServiceKeyName, cp.ServiceKeySecret
 	}
 
 	// 2. Check for secret
 	s, _ := aws.loadAWSAuthSecret(forceReload)
 	if s != nil && s.AccessKeyID != "" && s.SecretAccessKey != "" {
+		aws.ServiceAccountChecks["hasKey"] = &ServiceAccountCheck{
+			Message: "AWS ServiceKey exists",
+			Status:  true,
+		}
 		return s.AccessKeyID, s.SecretAccessKey
 	}
 
 	// 3. Fall back to env vars
-	return os.Getenv(awsAccessKeyIDEnvVar), os.Getenv(awsAccessKeySecretEnvVar)
+	if env.GetAWSAccessKeyID() == "" || env.GetAWSAccessKeyID() == "" {
+		aws.ServiceAccountChecks["hasKey"] = &ServiceAccountCheck{
+			Message: "AWS ServiceKey exists",
+			Status:  false,
+		}
+	} else {
+		aws.ServiceAccountChecks["hasKey"] = &ServiceAccountCheck{
+			Message: "AWS ServiceKey exists",
+			Status:  true,
+		}
+	}
+	return env.GetAWSAccessKeyID(), env.GetAWSAccessKeySecret()
 }
 
 // Load once and cache the result (even on failure). This is an install time secret, so
@@ -1000,11 +1167,11 @@ func (aws *AWS) configureAWSAuth() error {
 	accessKeyID := aws.ServiceKeyName
 	accessKeySecret := aws.ServiceKeySecret
 	if accessKeyID != "" && accessKeySecret != "" { // credentials may exist on the actual AWS node-- if so, use those. If not, override with the service key
-		err := os.Setenv(awsAccessKeyIDEnvVar, accessKeyID)
+		err := env.Set(env.AWSAccessKeyIDEnvVar, accessKeyID)
 		if err != nil {
 			return err
 		}
-		err = os.Setenv(awsAccessKeySecretEnvVar, accessKeySecret)
+		err = env.Set(env.AWSAccessKeySecretEnvVar, accessKeySecret)
 		if err != nil {
 			return err
 		}
@@ -1031,38 +1198,230 @@ func getClusterConfig(ccFile string) (map[string]string, error) {
 	return clusterConf, nil
 }
 
+// SetKeyEnv ensures that the two environment variables necessary to configure
+// a new AWS Session are set.
+func (a *AWS) SetKeyEnv() error {
+	// TODO add this to the helm chart, mirroring the cost-model
+	// configPath := env.GetConfigPath()
+	configPath := defaultConfigPath
+	path := configPath + "aws.json"
+
+	if _, err := os.Stat(path); err != nil {
+		if os.IsNotExist(err) {
+			log.DedupedErrorf(5, "file %s does not exist", path)
+		} else {
+			log.DedupedErrorf(5, "other file open error: %s", err)
+		}
+		return err
+	}
+
+	jsonFile, err := os.Open(path)
+	defer jsonFile.Close()
+
+	configMap := map[string]string{}
+	configBytes, err := ioutil.ReadAll(jsonFile)
+	if err != nil {
+		return err
+	}
+	json.Unmarshal([]byte(configBytes), &configMap)
+
+	keyName := configMap["awsServiceKeyName"]
+	keySecret := configMap["awsServiceKeySecret"]
+
+	// These are required before calling NewEnvCredentials below
+	env.Set(env.AWSAccessKeyIDEnvVar, keyName)
+	env.Set(env.AWSAccessKeySecretEnvVar, keySecret)
+
+	return nil
+}
+
+func (a *AWS) getAddressesForRegion(region string) (*ec2.DescribeAddressesOutput, error) {
+	sess, err := session.NewSession(&aws.Config{
+		Region:      aws.String(region),
+		Credentials: credentials.NewEnvCredentials(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ec2Svc := ec2.New(sess)
+	return ec2Svc.DescribeAddresses(&ec2.DescribeAddressesInput{})
+}
+
+func (a *AWS) GetAddresses() ([]byte, error) {
+	if err := a.SetKeyEnv(); err != nil {
+		return nil, err
+	}
+
+	addressCh := make(chan *ec2.DescribeAddressesOutput, len(awsRegions))
+	errorCh := make(chan error, len(awsRegions))
+
+	var wg sync.WaitGroup
+	wg.Add(len(awsRegions))
+
+	// Get volumes from each AWS region
+	for _, r := range awsRegions {
+		// Fetch IP address response and send results and errors to their
+		// respective channels
+		go func(region string) {
+			defer wg.Done()
+			defer errors.HandlePanic()
+
+			// Query for first page of volume results
+			resp, err := a.getAddressesForRegion(region)
+			if err != nil {
+				if aerr, ok := err.(awserr.Error); ok {
+					switch aerr.Code() {
+					default:
+						errorCh <- aerr
+					}
+					return
+				} else {
+					errorCh <- err
+					return
+				}
+			}
+			addressCh <- resp
+		}(r)
+	}
+
+	// Close the result channels after everything has been sent
+	go func() {
+		defer errors.HandlePanic()
+
+		wg.Wait()
+		close(errorCh)
+		close(addressCh)
+	}()
+
+	addresses := []*ec2.Address{}
+	for adds := range addressCh {
+		addresses = append(addresses, adds.Addresses...)
+	}
+
+	errors := []error{}
+	for err := range errorCh {
+		log.DedupedWarningf(5, "unable to get addresses: %s", err)
+		errors = append(errors, err)
+	}
+
+	// Return error if no addresses are returned
+	if len(errors) > 0 && len(addresses) == 0 {
+		return nil, fmt.Errorf("%d error(s) retrieving addresses: %v", len(errors), errors)
+	}
+
+	// Format the response this way to match the JSON-encoded formatting of a single response
+	// from DescribeAddresss, so that consumers can always expect AWS disk responses to have
+	// a "Addresss" key at the top level.
+	return json.Marshal(map[string][]*ec2.Address{
+		"Addresses": addresses,
+	})
+}
+
+func (a *AWS) getDisksForRegion(region string, maxResults int64, nextToken *string) (*ec2.DescribeVolumesOutput, error) {
+	sess, err := session.NewSession(&aws.Config{
+		Region:      aws.String(region),
+		Credentials: credentials.NewEnvCredentials(),
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	ec2Svc := ec2.New(sess)
+	return ec2Svc.DescribeVolumes(&ec2.DescribeVolumesInput{
+		MaxResults: &maxResults,
+		NextToken:  nextToken,
+	})
+}
+
 // GetDisks returns the AWS disks backing PVs. Useful because sometimes k8s will not clean up PVs correctly. Requires a json config in /var/configs with key region.
 func (a *AWS) GetDisks() ([]byte, error) {
-	err := a.configureAWSAuth()
-	if err != nil {
+	if err := a.SetKeyEnv(); err != nil {
 		return nil, err
 	}
 
-	clusterConfig, err := getClusterConfig("/var/configs/cluster.json")
-	if err != nil {
-		return nil, err
-	}
+	volumeCh := make(chan *ec2.DescribeVolumesOutput, len(awsRegions))
+	errorCh := make(chan error, len(awsRegions))
 
-	region := aws.String(clusterConfig["region"])
-	c := &aws.Config{
-		Region: region,
-	}
-	s := session.Must(session.NewSession(c))
+	var wg sync.WaitGroup
+	wg.Add(len(awsRegions))
 
-	ec2Svc := ec2.New(s)
-	input := &ec2.DescribeVolumesInput{}
-	volumeResult, err := ec2Svc.DescribeVolumes(input)
-	if err != nil {
-		if aerr, ok := err.(awserr.Error); ok {
-			switch aerr.Code() {
-			default:
-				return nil, aerr
+	// Get volumes from each AWS region
+	for _, r := range awsRegions {
+		// Fetch volume response and send results and errors to their
+		// respective channels
+		go func(region string) {
+			defer wg.Done()
+			defer errors.HandlePanic()
+
+			// Query for first page of volume results
+			resp, err := a.getDisksForRegion(region, 1000, nil)
+			if err != nil {
+				if aerr, ok := err.(awserr.Error); ok {
+					switch aerr.Code() {
+					default:
+						errorCh <- aerr
+					}
+					return
+				} else {
+					errorCh <- err
+					return
+				}
 			}
-		} else {
-			return nil, err
-		}
+			volumeCh <- resp
+
+			// A NextToken indicates more pages of results. Keep querying
+			// until all pages are retrieved.
+			for resp.NextToken != nil {
+				resp, err = a.getDisksForRegion(region, 100, resp.NextToken)
+				if err != nil {
+					if aerr, ok := err.(awserr.Error); ok {
+						switch aerr.Code() {
+						default:
+							errorCh <- aerr
+						}
+						return
+					} else {
+						errorCh <- err
+						return
+					}
+				}
+				volumeCh <- resp
+			}
+		}(r)
 	}
-	return json.Marshal(volumeResult)
+
+	// Close the result channels after everything has been sent
+	go func() {
+		defer errors.HandlePanic()
+
+		wg.Wait()
+		close(errorCh)
+		close(volumeCh)
+	}()
+
+	volumes := []*ec2.Volume{}
+	for vols := range volumeCh {
+		volumes = append(volumes, vols.Volumes...)
+	}
+
+	errors := []error{}
+	for err := range errorCh {
+		log.DedupedWarningf(5, "unable to get disks: %s", err)
+		errors = append(errors, err)
+	}
+
+	// Return error if no volumes are returned
+	if len(errors) > 0 && len(volumes) == 0 {
+		return nil, fmt.Errorf("%d error(s) retrieving volumes: %v", len(errors), errors)
+	}
+
+	// Format the response this way to match the JSON-encoded formatting of a single response
+	// from DescribeVolumes, so that consumers can always expect AWS disk responses to have
+	// a "Volumes" key at the top level.
+	return json.Marshal(map[string][]*ec2.Volume{
+		"Volumes": volumes,
+	})
 }
 
 // ConvertToGlueColumnFormat takes a string and runs through various regex
@@ -1125,11 +1484,11 @@ func (a *AWS) QueryAthenaBillingData(query string) (*athena.GetQueryResultsOutpu
 		return nil, err
 	}
 	if customPricing.ServiceKeyName != "" {
-		err = os.Setenv(awsAccessKeyIDEnvVar, customPricing.ServiceKeyName)
+		err = env.Set(env.AWSAccessKeyIDEnvVar, customPricing.ServiceKeyName)
 		if err != nil {
 			return nil, err
 		}
-		err = os.Setenv(awsAccessKeySecretEnvVar, customPricing.ServiceKeySecret)
+		err = env.Set(env.AWSAccessKeySecretEnvVar, customPricing.ServiceKeySecret)
 		if err != nil {
 			return nil, err
 		}
@@ -1142,6 +1501,13 @@ func (a *AWS) QueryAthenaBillingData(query string) (*athena.GetQueryResultsOutpu
 	}
 	s := session.Must(session.NewSession(c))
 	svc := athena.New(s)
+	if customPricing.MasterPayerARN != "" {
+		creds := stscreds.NewCredentials(s, customPricing.MasterPayerARN)
+		svc = athena.New(s, &aws.Config{
+			Region:      region,
+			Credentials: creds,
+		})
+	}
 
 	var e athena.StartQueryExecutionInput
 
@@ -1189,6 +1555,76 @@ func (a *AWS) QueryAthenaBillingData(query string) (*athena.GetQueryResultsOutpu
 	}
 }
 
+type SavingsPlanData struct {
+	ResourceID     string
+	EffectiveCost  float64
+	SavingsPlanARN string
+	MostRecentDate string
+}
+
+func (a *AWS) GetSavingsPlanDataFromAthena() error {
+	cfg, err := a.GetConfig()
+	if err != nil {
+		return err
+	}
+	if cfg.AthenaBucketName == "" {
+		return fmt.Errorf("No Athena Bucket configured")
+	}
+	if a.SavingsPlanDataByInstanceID == nil {
+		a.SavingsPlanDataByInstanceID = make(map[string]*SavingsPlanData)
+	}
+	tNow := time.Now()
+	tOneDayAgo := tNow.Add(time.Duration(-25) * time.Hour) // Also get files from one day ago to avoid boundary conditions
+	start := tOneDayAgo.Format("2006-01-02")
+	end := tNow.Format("2006-01-02")
+	q := `SELECT   
+		line_item_usage_start_date,
+		savings_plan_savings_plan_a_r_n,
+		line_item_resource_id,
+		savings_plan_savings_plan_effective_cost
+	FROM %s as cost_data
+	WHERE line_item_usage_start_date BETWEEN date '%s' AND date '%s'
+	AND line_item_line_item_type = 'SavingsPlanCoveredUsage' ORDER BY 
+	line_item_usage_start_date DESC`
+	query := fmt.Sprintf(q, cfg.AthenaTable, start, end)
+	op, err := a.QueryAthenaBillingData(query)
+	if err != nil {
+		return fmt.Errorf("Error fetching Savings Plan Data: %s", err)
+	}
+	klog.Infof("Fetching SavingsPlan data...")
+	if len(op.ResultSet.Rows) > 1 {
+		a.SavingsPlanDataLock.Lock()
+		mostRecentDate := ""
+		for _, r := range op.ResultSet.Rows[1:(len(op.ResultSet.Rows) - 1)] {
+			d := *r.Data[0].VarCharValue
+			if mostRecentDate == "" {
+				mostRecentDate = d
+			} else if mostRecentDate != d { // Get all most recent assignments
+				break
+			}
+			cost, err := strconv.ParseFloat(*r.Data[3].VarCharValue, 64)
+			if err != nil {
+				klog.Infof("Error converting `%s` from float ", *r.Data[3].VarCharValue)
+			}
+			r := &SavingsPlanData{
+				ResourceID:     *r.Data[2].VarCharValue,
+				EffectiveCost:  cost,
+				SavingsPlanARN: *r.Data[1].VarCharValue,
+				MostRecentDate: d,
+			}
+			a.SavingsPlanDataByInstanceID[r.ResourceID] = r
+		}
+		klog.V(1).Infof("Found %d savings plan applied instances", len(a.SavingsPlanDataByInstanceID))
+		for k, r := range a.SavingsPlanDataByInstanceID {
+			klog.V(1).Infof("Reserved Instance Data found for node %s : %f at time %s", k, r.EffectiveCost, r.MostRecentDate)
+		}
+		a.SavingsPlanDataLock.Unlock()
+	} else {
+		klog.Infof("No savings plan applied instance data found")
+	}
+	return nil
+}
+
 type RIData struct {
 	ResourceID     string
 	EffectiveCost  float64
@@ -1216,11 +1652,11 @@ func (a *AWS) GetReservationDataFromAthena() error {
 		reservation_reservation_a_r_n,
 		line_item_resource_id,
 		reservation_effective_cost
-	FROM athena_test as cost_data
+	FROM %s as cost_data
 	WHERE line_item_usage_start_date BETWEEN date '%s' AND date '%s'
 	AND reservation_reservation_a_r_n <> '' ORDER BY 
 	line_item_usage_start_date DESC`
-	query := fmt.Sprintf(q, start, end)
+	query := fmt.Sprintf(q, cfg.AthenaTable, start, end)
 	op, err := a.QueryAthenaBillingData(query)
 	if err != nil {
 		return fmt.Errorf("Error fetching Reserved Instance Data: %s", err)
@@ -1274,6 +1710,8 @@ func (a *AWS) ExternalAllocations(start string, end string, aggregators []string
 		formattedAggregators = append(formattedAggregators, aggregator_column_name)
 	}
 	aggregatorNames := strings.Join(formattedAggregators, ",")
+	aggregatorOr := strings.Join(formattedAggregators, " <> '' OR ")
+	aggregatorOr = aggregatorOr + " <> ''"
 
 	filter_column_name := "resource_tags_user_" + filterType
 	filter_column_name = ConvertToGlueColumnFormat(filter_column_name)
@@ -1290,8 +1728,8 @@ func (a *AWS) ExternalAllocations(start string, end string, aggregators []string
 			%s,
 			SUM(line_item_blended_cost) as blended_cost
 		FROM %s as cost_data
-		WHERE (%s='%s') AND line_item_usage_start_date BETWEEN date '%s' AND date '%s'
-		GROUP BY %s`, aggregatorNames, filter_column_name, customPricing.AthenaTable, filter_column_name, filterValue, start, end, groupby)
+		WHERE (%s='%s') AND line_item_usage_start_date BETWEEN date '%s' AND date '%s' AND (%s) 
+		GROUP BY %s`, aggregatorNames, filter_column_name, customPricing.AthenaTable, filter_column_name, filterValue, start, end, aggregatorOr, groupby)
 	} else {
 		lastIdx = len(formattedAggregators) + 2
 		groupby := generateAWSGroupBy(lastIdx)
@@ -1301,18 +1739,18 @@ func (a *AWS) ExternalAllocations(start string, end string, aggregators []string
 			line_item_product_code,
 			SUM(line_item_blended_cost) as blended_cost
 		FROM %s as cost_data
-		WHERE line_item_usage_start_date BETWEEN date '%s' AND date '%s'
-		GROUP BY %s`, aggregatorNames, customPricing.AthenaTable, start, end, groupby)
+		WHERE line_item_usage_start_date BETWEEN date '%s' AND date '%s' AND (%s)
+		GROUP BY %s`, aggregatorNames, customPricing.AthenaTable, start, end, aggregatorOr, groupby)
 	}
 
 	klog.V(3).Infof("Running Query: %s", query)
 
 	if customPricing.ServiceKeyName != "" {
-		err = os.Setenv(awsAccessKeyIDEnvVar, customPricing.ServiceKeyName)
+		err = env.Set(env.AWSAccessKeyIDEnvVar, customPricing.ServiceKeyName)
 		if err != nil {
 			return nil, err
 		}
-		err = os.Setenv(awsAccessKeySecretEnvVar, customPricing.ServiceKeySecret)
+		err = env.Set(env.AWSAccessKeySecretEnvVar, customPricing.ServiceKeySecret)
 		if err != nil {
 			return nil, err
 		}
@@ -1372,8 +1810,7 @@ func (a *AWS) ExternalAllocations(start string, end string, aggregators []string
 			return nil, err
 		}
 		if len(op.ResultSet.Rows) > 1 {
-			for _, r := range op.ResultSet.Rows[1:(len(op.ResultSet.Rows) - 1)] {
-
+			for _, r := range op.ResultSet.Rows[1:(len(op.ResultSet.Rows))] {
 				cost, err := strconv.ParseFloat(*r.Data[lastIdx].VarCharValue, 64)
 				if err != nil {
 					return nil, err
@@ -1409,8 +1846,7 @@ func (a *AWS) ExternalAllocations(start string, end string, aggregators []string
 		}
 		oocAllocs = append(oocAllocs, gcpOOC...)
 	}
-
-	return oocAllocs, nil // TODO: transform the QuerySQL lines into the new OutOfClusterAllocation Struct
+	return oocAllocs, nil
 }
 
 // QuerySQL can query a properly configured Athena database.
@@ -1422,11 +1858,11 @@ func (a *AWS) QuerySQL(query string) ([]byte, error) {
 		return nil, err
 	}
 	if customPricing.ServiceKeyName != "" {
-		err = os.Setenv(awsAccessKeyIDEnvVar, customPricing.ServiceKeyName)
+		err = env.Set(env.AWSAccessKeyIDEnvVar, customPricing.ServiceKeyName)
 		if err != nil {
 			return nil, err
 		}
-		err = os.Setenv(awsAccessKeySecretEnvVar, customPricing.ServiceKeySecret)
+		err = env.Set(env.AWSAccessKeySecretEnvVar, customPricing.ServiceKeySecret)
 		if err != nil {
 			return nil, err
 		}
@@ -1545,14 +1981,18 @@ func (f fnames) Less(i, j int) bool {
 	return t1.Before(t2)
 }
 
-func parseSpotData(bucket string, prefix string, projectID string, region string, accessKeyID string, accessKeySecret string) (map[string]*spotInfo, error) {
+func (a *AWS) parseSpotData(bucket string, prefix string, projectID string, region string, accessKeyID string, accessKeySecret string) (map[string]*spotInfo, error) {
+	if a.ServiceAccountChecks == nil { // Set up checks to store error/success states
+		a.ServiceAccountChecks = make(map[string]*ServiceAccountCheck)
+	}
 
-	if accessKeyID != "" && accessKeySecret != "" { // credentials may exist on the actual AWS node-- if so, use those. If not, override with the service key
-		err := os.Setenv(awsAccessKeyIDEnvVar, accessKeyID)
+	// credentials may exist on the actual AWS node-- if so, use those. If not, override with the service key
+	if accessKeyID != "" && accessKeySecret != "" {
+		err := env.Set(env.AWSAccessKeyIDEnvVar, accessKeyID)
 		if err != nil {
 			return nil, err
 		}
-		err = os.Setenv(awsAccessKeySecretEnvVar, accessKeySecret)
+		err = env.Set(env.AWSAccessKeySecretEnvVar, accessKeySecret)
 		if err != nil {
 			return nil, err
 		}
@@ -1580,7 +2020,17 @@ func parseSpotData(bucket string, prefix string, projectID string, region string
 	}
 	lso, err := s3Svc.ListObjects(ls)
 	if err != nil {
+		a.ServiceAccountChecks["bucketList"] = &ServiceAccountCheck{
+			Message:        "Bucket List Permissions Available",
+			Status:         false,
+			AdditionalInfo: err.Error(),
+		}
 		return nil, err
+	} else {
+		a.ServiceAccountChecks["bucketList"] = &ServiceAccountCheck{
+			Message: "Bucket List Permissions Available",
+			Status:  true,
+		}
 	}
 	lsoLen := len(lso.Contents)
 	klog.V(2).Infof("Found %d spot data files from yesterday", lsoLen)
@@ -1597,6 +2047,7 @@ func parseSpotData(bucket string, prefix string, projectID string, region string
 		klog.V(5).Infof("ListObjects \"s3://%s/%s\" produced no keys", *ls2.Bucket, *ls2.Prefix)
 	}
 
+	// TODO: Worth it to use LastModifiedDate to determine if we should reparse the spot data?
 	var keys []*string
 	for _, obj := range lso.Contents {
 		keys = append(keys, obj.Key)
@@ -1622,7 +2073,17 @@ func parseSpotData(bucket string, prefix string, projectID string, region string
 		buf := aws.NewWriteAtBuffer([]byte{})
 		_, err := downloader.Download(buf, getObj)
 		if err != nil {
+			a.ServiceAccountChecks["objectList"] = &ServiceAccountCheck{
+				Message:        "Object Get Permissions Available",
+				Status:         false,
+				AdditionalInfo: err.Error(),
+			}
 			return nil, err
+		} else {
+			a.ServiceAccountChecks["objectList"] = &ServiceAccountCheck{
+				Message: "Object Get Permissions Available",
+				Status:  true,
+			}
 		}
 
 		r := bytes.NewReader(buf.Bytes())
@@ -1681,7 +2142,7 @@ func parseSpotData(bucket string, prefix string, projectID string, region string
 				continue
 			}
 
-			klog.V(4).Infof("Found spot info %+v", spot)
+			log.DedupedInfof(5, "Found spot info for: %s", spot.InstanceID)
 			spots[spot.InstanceID] = &spot
 		}
 		gr.Close()
@@ -1923,4 +2384,18 @@ func (a *AWS) getReservedInstances() ([]*AWSReservedInstance, error) {
 	}
 
 	return reservedInstances, nil
+}
+
+func (a *AWS) ServiceAccountStatus() *ServiceAccountStatus {
+	checks := []*ServiceAccountCheck{}
+	for _, v := range a.ServiceAccountChecks {
+		checks = append(checks, v)
+	}
+	return &ServiceAccountStatus{
+		Checks: checks,
+	}
+}
+
+func (aws *AWS) CombinedDiscountForNode(instanceType string, isPreemptible bool, defaultDiscount, negotiatedDiscount float64) float64 {
+	return 1.0 - ((1.0 - defaultDiscount) * (1.0 - negotiatedDiscount))
 }

@@ -8,7 +8,6 @@ import (
 	"io/ioutil"
 	"math"
 	"net/http"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -19,8 +18,11 @@ import (
 
 	"cloud.google.com/go/bigquery"
 	"cloud.google.com/go/compute/metadata"
+
 	"github.com/kubecost/cost-model/pkg/clustercache"
+	"github.com/kubecost/cost-model/pkg/env"
 	"github.com/kubecost/cost-model/pkg/util"
+
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
 	compute "google.golang.org/api/compute/v1"
@@ -52,6 +54,8 @@ type GCP struct {
 	DownloadPricingDataLock sync.RWMutex
 	ReservedInstances       []*GCPReservedInstance
 	Config                  *ProviderConfig
+	serviceKeyProvided      bool
+	ValidPricingKeys        map[string]bool
 	*CustomProvider
 }
 
@@ -183,10 +187,7 @@ func (gcp *GCP) GetManagementPlatform() (string, error) {
 
 // Attempts to load a GCP auth secret and copy the contents to the key file.
 func (*GCP) loadGCPAuthSecret() {
-	path := os.Getenv("CONFIG_PATH")
-	if path == "" {
-		path = "/models/"
-	}
+	path := env.GetConfigPathWithDefault("/models/")
 
 	keyPath := path + "key.json"
 	keyExists, _ := util.FileExists(keyPath)
@@ -240,16 +241,14 @@ func (gcp *GCP) UpdateConfig(r io.Reader, updateType string) (*CustomPricing, er
 					return err
 				}
 
-				path := os.Getenv("CONFIG_PATH")
-				if path == "" {
-					path = "/models/"
-				}
+				path := env.GetConfigPathWithDefault("/models/")
 
 				keyPath := path + "key.json"
 				err = ioutil.WriteFile(keyPath, j, 0644)
 				if err != nil {
 					return err
 				}
+				gcp.serviceKeyProvided = true
 			}
 		} else if updateType == AthenaInfoUpdateType {
 			a := AwsAthenaInfo{}
@@ -289,9 +288,8 @@ func (gcp *GCP) UpdateConfig(r io.Reader, updateType string) (*CustomPricing, er
 			}
 		}
 
-		remoteEnabled := os.Getenv(remoteEnabled)
-		if remoteEnabled == "true" {
-			err := UpdateClusterMeta(os.Getenv(clusterIDKey), c.ClusterName)
+		if env.IsRemoteEnabled() {
+			err := UpdateClusterMeta(env.GetClusterID(), c.ClusterName)
 			if err != nil {
 				return err
 			}
@@ -390,12 +388,12 @@ func (gcp *GCP) ExternalAllocations(start string, end string, aggregators []stri
 			AND usage_start_time >= "%s" AND usage_start_time < "%s"
 			GROUP BY service, keys
 		)`, c.BillingDataDataset, aggregator, filterType, filterValue, start, end)
-		klog.V(3).Infof("Querying \"%s\" with : %s", c.ProjectID, queryString)
+		klog.V(4).Infof("Querying \"%s\" with : %s", c.ProjectID, queryString)
 		gcpOOC, err := gcp.multiLabelQuery(queryString, aggregators)
 		s = append(s, gcpOOC...)
 		qerr = err
 	}
-	if qerr != nil {
+	if qerr != nil && gcp.serviceKeyProvided {
 		klog.Infof("Error querying gcp: %s", qerr)
 	}
 	return s, qerr
@@ -466,11 +464,8 @@ func (gcp *GCP) QuerySQL(query string) ([]*OutOfClusterAllocation, error) {
 
 // ClusterName returns the name of a GKE cluster, as provided by metadata.
 func (gcp *GCP) ClusterInfo() (map[string]string, error) {
-	remote := os.Getenv(remoteEnabled)
-	remoteEnabled := false
-	if os.Getenv(remote) == "true" {
-		remoteEnabled = true
-	}
+	remoteEnabled := env.IsRemoteEnabled()
+
 	metadataClient := metadata.NewClient(&http.Client{Transport: userAgentTransport{
 		userAgent: "kubecost",
 		base:      http.DefaultTransport,
@@ -492,9 +487,37 @@ func (gcp *GCP) ClusterInfo() (map[string]string, error) {
 	m := make(map[string]string)
 	m["name"] = attribute
 	m["provider"] = "GCP"
-	m["id"] = os.Getenv(clusterIDKey)
+	m["id"] = env.GetClusterID()
 	m["remoteReadEnabled"] = strconv.FormatBool(remoteEnabled)
 	return m, nil
+}
+
+func (*GCP) GetAddresses() ([]byte, error) {
+	// metadata API setup
+	metadataClient := metadata.NewClient(&http.Client{Transport: userAgentTransport{
+		userAgent: "kubecost",
+		base:      http.DefaultTransport,
+	}})
+	projID, err := metadataClient.ProjectID()
+	if err != nil {
+		return nil, err
+	}
+
+	client, err := google.DefaultClient(oauth2.NoContext,
+		"https://www.googleapis.com/auth/compute.readonly")
+	if err != nil {
+		return nil, err
+	}
+	svc, err := compute.New(client)
+	if err != nil {
+		return nil, err
+	}
+	res, err := svc.Addresses.AggregatedList(projID).Do()
+
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(res)
 }
 
 // GetDisks returns the GCP disks backing PVs. Useful because sometimes k8s will not clean up PVs correctly. Requires a json config in /var/configs with key region.
@@ -685,6 +708,10 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]Key, pvKeys map[stri
 				}
 
 				candidateKeys := []string{}
+				if gcp.ValidPricingKeys == nil {
+					gcp.ValidPricingKeys = make(map[string]bool)
+				}
+
 				for _, region := range product.ServiceRegions {
 					if instanceType == "e2" { // this needs to be done to handle a partial cpu mapping
 						candidateKeys = append(candidateKeys, region+","+"e2micro"+","+usageType)
@@ -701,6 +728,8 @@ func (gcp *GCP) parsePage(r io.Reader, inputKeys map[string]Key, pvKeys map[stri
 					instanceType = strings.Split(candidateKey, ",")[1] // we may have overriden this while generating candidate keys
 					region := strings.Split(candidateKey, ",")[0]
 					candidateKeyGPU := candidateKey + ",gpu"
+					gcp.ValidPricingKeys[candidateKey] = true
+					gcp.ValidPricingKeys[candidateKeyGPU] = true
 					if gpuType != "" {
 						lastRateIndex := len(product.PricingInfo[0].PricingExpression.TieredRates) - 1
 						var nanos float64
@@ -915,7 +944,7 @@ func (gcp *GCP) DownloadPricingData() error {
 
 	for _, n := range nodeList {
 		labels := n.GetObjectMeta().GetLabels()
-		key := gcp.GetKey(labels)
+		key := gcp.GetKey(labels, n)
 		inputkeys[key.Features()] = key
 	}
 
@@ -1257,7 +1286,7 @@ type gcpKey struct {
 	Labels map[string]string
 }
 
-func (gcp *GCP) GetKey(labels map[string]string) Key {
+func (gcp *GCP) GetKey(labels map[string]string, n *v1.Node) Key {
 	return &gcpKey{
 		Labels: labels,
 	}
@@ -1316,15 +1345,59 @@ func (gcp *GCP) AllNodePricing() (interface{}, error) {
 	return gcp.Pricing, nil
 }
 
-// NodePricing returns GCP pricing data for a single node
-func (gcp *GCP) NodePricing(key Key) (*Node, error) {
+func (gcp *GCP) getPricing(key Key) (*GCPPricing, bool) {
 	gcp.DownloadPricingDataLock.RLock()
 	defer gcp.DownloadPricingDataLock.RUnlock()
-	if n, ok := gcp.Pricing[key.Features()]; ok {
+	n, ok := gcp.Pricing[key.Features()]
+	return n, ok
+}
+func (gcp *GCP) isValidPricingKey(key Key) bool {
+	gcp.DownloadPricingDataLock.RLock()
+	defer gcp.DownloadPricingDataLock.RUnlock()
+	_, ok := gcp.ValidPricingKeys[key.Features()]
+	return ok
+}
+
+// NodePricing returns GCP pricing data for a single node
+func (gcp *GCP) NodePricing(key Key) (*Node, error) {
+	if n, ok := gcp.getPricing(key); ok {
 		klog.V(4).Infof("Returning pricing for node %s: %+v from SKU %s", key, n.Node, n.Name)
 		n.Node.BaseCPUPrice = gcp.BaseCPUPrice
 		return n.Node, nil
+	} else if ok := gcp.isValidPricingKey(key); ok {
+		err := gcp.DownloadPricingData()
+		if err != nil {
+			return nil, fmt.Errorf("Download pricing data failed: %s", err.Error())
+		}
+		if n, ok := gcp.getPricing(key); ok {
+			klog.V(4).Infof("Returning pricing for node %s: %+v from SKU %s", key, n.Node, n.Name)
+			n.Node.BaseCPUPrice = gcp.BaseCPUPrice
+			return n.Node, nil
+		}
+		klog.V(1).Infof("[Warning] no pricing data found for %s: %s", key.Features(), key)
+		return nil, fmt.Errorf("Warning: no pricing data found for %s", key)
 	}
-	klog.V(1).Infof("[Warning] no pricing data found for %s: %s", key.Features(), key)
 	return nil, fmt.Errorf("Warning: no pricing data found for %s", key)
+}
+
+func (gcp *GCP) ServiceAccountStatus() *ServiceAccountStatus {
+	return &ServiceAccountStatus{
+		Checks: []*ServiceAccountCheck{},
+	}
+}
+
+func (gcp *GCP) CombinedDiscountForNode(instanceType string, isPreemptible bool, defaultDiscount, negotiatedDiscount float64) float64 {
+	class := strings.Split(instanceType, "-")[0]
+	return 1.0 - ((1.0 - sustainedUseDiscount(class, defaultDiscount)) * (1.0 - negotiatedDiscount))
+}
+
+func sustainedUseDiscount(class string, defaultDiscount float64) float64 {
+	discount := defaultDiscount
+	switch class {
+	case "e2", "f1", "g1":
+		discount = 0.0
+	case "n2":
+		discount = 0.2
+	}
+	return discount
 }

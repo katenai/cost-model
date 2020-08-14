@@ -8,7 +8,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -17,9 +16,16 @@ import (
 	"k8s.io/klog"
 
 	"github.com/julienschmidt/httprouter"
+
+	sentry "github.com/getsentry/sentry-go"
+
 	costAnalyzerCloud "github.com/kubecost/cost-model/pkg/cloud"
 	"github.com/kubecost/cost-model/pkg/clustercache"
 	cm "github.com/kubecost/cost-model/pkg/clustermanager"
+	"github.com/kubecost/cost-model/pkg/env"
+	"github.com/kubecost/cost-model/pkg/errors"
+	"github.com/kubecost/cost-model/pkg/prom"
+	"github.com/kubecost/cost-model/pkg/thanos"
 	prometheusClient "github.com/prometheus/client_golang/api"
 	prometheusAPI "github.com/prometheus/client_golang/api/prometheus/v1"
 	v1 "k8s.io/api/core/v1"
@@ -33,14 +39,20 @@ import (
 )
 
 const (
-	prometheusServerEndpointEnvVar = "PROMETHEUS_SERVER_ENDPOINT"
-	prometheusTroubleshootingEp    = "http://docs.kubecost.com/custom-prom#troubleshoot"
-	RFC3339Milli                   = "2006-01-02T15:04:05.000Z"
+	prometheusTroubleshootingEp = "http://docs.kubecost.com/custom-prom#troubleshoot"
+	RFC3339Milli                = "2006-01-02T15:04:05.000Z"
 )
 
 var (
 	// gitCommit is set by the build system
-	gitCommit string
+	gitCommit                       string
+	logCollectionEnabled            bool   = env.IsLogCollectionEnabled()
+	productAnalyticsEnabled         bool   = env.IsProductAnalyticsEnabled()
+	errorReportingEnabled           bool   = env.IsErrorReportingEnabled()
+	valuesReportingEnabled          bool   = env.IsValuesReportingEnabled()
+	clusterProfile                  string = env.GetClusterProfile()
+	multiclusterDBBasicAuthUsername string = env.GetMultiClusterBasicAuthUsername()
+	multiclusterDBBasicAuthPW       string = env.GetMultiClusterBasicAuthPassword()
 )
 
 var Router = httprouter.New()
@@ -61,7 +73,6 @@ type Accesses struct {
 	CPUAllocationRecorder         *prometheus.GaugeVec
 	GPUAllocationRecorder         *prometheus.GaugeVec
 	PVAllocationRecorder          *prometheus.GaugeVec
-	ContainerUptimeRecorder       *prometheus.GaugeVec
 	NetworkZoneEgressRecorder     prometheus.Gauge
 	NetworkRegionEgressRecorder   prometheus.Gauge
 	NetworkInternetEgressRecorder prometheus.Gauge
@@ -140,6 +151,9 @@ func filterFields(fields string, data map[string]*CostData) map[string]CostData 
 }
 
 func normalizeTimeParam(param string) (string, error) {
+	if param == "" {
+		return "", fmt.Errorf("invalid time param")
+	}
 	// convert days to hours
 	if param[len(param)-1:] == "d" {
 		count := param[:len(param)-1]
@@ -152,6 +166,14 @@ func normalizeTimeParam(param string) (string, error) {
 	}
 
 	return param, nil
+}
+
+// writeReportingFlags writes the reporting flags to the cluster info map
+func writeReportingFlags(clusterInfo map[string]string) {
+	clusterInfo["logCollection"] = fmt.Sprintf("%t", logCollectionEnabled)
+	clusterInfo["productAnalytics"] = fmt.Sprintf("%t", productAnalyticsEnabled)
+	clusterInfo["errorReporting"] = fmt.Sprintf("%t", errorReportingEnabled)
+	clusterInfo["valuesReporting"] = fmt.Sprintf("%t", valuesReportingEnabled)
 }
 
 // parsePercentString takes a string of expected format "N%" and returns a floating point 0.0N.
@@ -320,7 +342,7 @@ func (a *Accesses) ClusterCosts(w http.ResponseWriter, r *http.Request, ps httpr
 	window := r.URL.Query().Get("window")
 	offset := r.URL.Query().Get("offset")
 
-	data, err := ComputeClusterCosts(a.PrometheusClient, a.Cloud, window, offset)
+	data, err := ComputeClusterCosts(a.PrometheusClient, a.Cloud, window, offset, true)
 	w.Write(WrapData(data, err))
 }
 
@@ -349,11 +371,7 @@ func (a *Accesses) CostDataModelRange(w http.ResponseWriter, r *http.Request, ps
 	cluster := r.URL.Query().Get("cluster")
 	remote := r.URL.Query().Get("remote")
 
-	remoteAvailable := os.Getenv(remoteEnabled)
-	remoteEnabled := false
-	if remoteAvailable == "true" && remote != "false" {
-		remoteEnabled = true
-	}
+	remoteEnabled := env.IsRemoteEnabled() && remote != "false"
 
 	// Use Thanos Client if it exists (enabled) and remote flag set
 	var pClient prometheusClient.Client
@@ -607,8 +625,30 @@ func (p *Accesses) ClusterInfo(w http.ResponseWriter, r *http.Request, ps httpro
 	} else {
 		klog.Infof("Could not get k8s version info: %s", err.Error())
 	}
-	w.Write(WrapData(data, err))
 
+	// Ensure we create the info object if it doesn't exist
+	if data == nil {
+		data = make(map[string]string)
+	}
+
+	data["clusterProfile"] = clusterProfile
+
+	// Include Product Reporting Flags with Cluster Info
+	writeReportingFlags(data)
+
+	// Include Thanos Offset Duration if Applicable
+	if thanos.IsEnabled() {
+		data["thanosOffset"] = thanos.Offset()
+	}
+
+	w.Write(WrapData(data, err))
+}
+
+func (p *Accesses) GetServiceAccountStatus(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	w.Write(WrapData(A.Cloud.ServiceAccountStatus(), nil))
 }
 
 func (p *Accesses) GetPrometheusMetadata(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
@@ -617,15 +657,10 @@ func (p *Accesses) GetPrometheusMetadata(w http.ResponseWriter, _ *http.Request,
 	w.Write(WrapData(ValidatePrometheus(p.PrometheusClient, false)))
 }
 
-func (p *Accesses) ContainerUptimes(w http.ResponseWriter, _ *http.Request, _ httprouter.Params) {
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	res, err := ComputeUptimes(p.PrometheusClient)
-	w.Write(WrapData(res, err))
-}
-
 func (a *Accesses) recordPrices() {
 	go func() {
+		defer errors.HandlePanic()
+
 		containerSeen := make(map[string]bool)
 		nodeSeen := make(map[string]bool)
 		pvSeen := make(map[string]bool)
@@ -712,11 +747,11 @@ func (a *Accesses) recordPrices() {
 
 				totalCost := cpu*cpuCost + ramCost*(ram/1024/1024/1024) + gpu*gpuCost
 
-				a.CPUPriceRecorder.WithLabelValues(nodeName, nodeName, nodeType, nodeRegion).Set(cpuCost)
-				a.RAMPriceRecorder.WithLabelValues(nodeName, nodeName, nodeType, nodeRegion).Set(ramCost)
-				a.GPUPriceRecorder.WithLabelValues(nodeName, nodeName, nodeType, nodeRegion).Set(gpuCost)
-				a.NodeTotalPriceRecorder.WithLabelValues(nodeName, nodeName, nodeType, nodeRegion).Set(totalCost)
-				labelKey := getKeyFromLabelStrings(nodeName, nodeName)
+				a.CPUPriceRecorder.WithLabelValues(nodeName, nodeName, nodeType, nodeRegion, node.ProviderID).Set(cpuCost)
+				a.RAMPriceRecorder.WithLabelValues(nodeName, nodeName, nodeType, nodeRegion, node.ProviderID).Set(ramCost)
+				a.GPUPriceRecorder.WithLabelValues(nodeName, nodeName, nodeType, nodeRegion, node.ProviderID).Set(gpuCost)
+				a.NodeTotalPriceRecorder.WithLabelValues(nodeName, nodeName, nodeType, nodeRegion, node.ProviderID).Set(totalCost)
+				labelKey := getKeyFromLabelStrings(nodeName, nodeName, nodeType, nodeRegion, node.ProviderID)
 				nodeSeen[labelKey] = true
 			}
 
@@ -788,19 +823,35 @@ func (a *Accesses) recordPrices() {
 					labelKey := getKeyFromLabelStrings(pv.Name, pv.Name)
 					pvSeen[labelKey] = true
 				}
-				containerUptime, _ := ComputeUptimes(a.PrometheusClient)
-				for key, uptime := range containerUptime {
-					container, _ := NewContainerMetricFromKey(key)
-					a.ContainerUptimeRecorder.WithLabelValues(container.Namespace, container.PodName, container.ContainerName).Set(uptime)
-				}
 			}
 			for labelString, seen := range nodeSeen {
 				if !seen {
+					klog.Infof("Removing %s from nodes", labelString)
 					labels := getLabelStringsFromKey(labelString)
-					a.NodeTotalPriceRecorder.DeleteLabelValues(labels...)
-					a.CPUPriceRecorder.DeleteLabelValues(labels...)
-					a.GPUPriceRecorder.DeleteLabelValues(labels...)
-					a.RAMPriceRecorder.DeleteLabelValues(labels...)
+					ok := a.NodeTotalPriceRecorder.DeleteLabelValues(labels...)
+					if ok {
+						klog.Infof("removed %s from totalprice", labelString)
+					} else {
+						klog.Infof("FAILURE TO REMOVE %s from totalprice", labelString)
+					}
+					ok = a.CPUPriceRecorder.DeleteLabelValues(labels...)
+					if ok {
+						klog.Infof("removed %s from cpuprice", labelString)
+					} else {
+						klog.Infof("FAILURE TO REMOVE %s from cpuprice", labelString)
+					}
+					ok = a.GPUPriceRecorder.DeleteLabelValues(labels...)
+					if ok {
+						klog.Infof("removed %s from gpuprice", labelString)
+					} else {
+						klog.Infof("FAILURE TO REMOVE %s from gpuprice", labelString)
+					}
+					ok = a.RAMPriceRecorder.DeleteLabelValues(labels...)
+					if ok {
+						klog.Infof("removed %s from ramprice", labelString)
+					} else {
+						klog.Infof("FAILURE TO REMOVE %s from ramprice", labelString)
+					}
 					delete(nodeSeen, labelString)
 				}
 				nodeSeen[labelString] = false
@@ -811,7 +862,6 @@ func (a *Accesses) recordPrices() {
 					a.RAMAllocationRecorder.DeleteLabelValues(labels...)
 					a.CPUAllocationRecorder.DeleteLabelValues(labels...)
 					a.GPUAllocationRecorder.DeleteLabelValues(labels...)
-					a.ContainerUptimeRecorder.DeleteLabelValues(labels...)
 					delete(containerSeen, labelString)
 				}
 				containerSeen[labelString] = false
@@ -849,7 +899,7 @@ func newClusterManager() *cm.ClusterManager {
 	// NOTE: configmap approach is currently the "persistent" source (entries are read-only
 	// NOTE: on the backend), we don't currently need to store on disk.
 	/*
-		path := os.Getenv("CONFIG_PATH")
+		path := env.GetConfigPath()
 		db, err := bolt.Open(path+"costmodel.db", 0600, nil)
 		if err != nil {
 			klog.V(1).Infof("[Error] Failed to create costmodel.db: %s", err.Error())
@@ -871,16 +921,61 @@ type ConfigWatchers struct {
 	WatchFunc     func(string, map[string]string) error
 }
 
+// captures the panic event in sentry
+func capturePanicEvent(err string, stack string) {
+	msg := fmt.Sprintf("Panic: %s\nStackTrace: %s\n", err, stack)
+	sentry.CurrentHub().CaptureEvent(&sentry.Event{
+		Level:   sentry.LevelError,
+		Message: msg,
+	})
+	sentry.Flush(5 * time.Second)
+}
+
+// handle any panics reported by the errors package
+func handlePanic(p errors.Panic) bool {
+	err := p.Error
+
+	if err != nil {
+		if err, ok := err.(error); ok {
+			capturePanicEvent(err.Error(), p.Stack)
+		}
+
+		if err, ok := err.(string); ok {
+			capturePanicEvent(err, p.Stack)
+		}
+	}
+
+	// Return true to recover iff the type is http, otherwise allow kubernetes
+	// to recover.
+	return p.Type == errors.PanicTypeHTTP
+}
+
 func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 	klog.InitFlags(nil)
 	flag.Set("v", "3")
 	flag.Parse()
 	klog.V(1).Infof("Starting cost-model (git commit \"%s\")", gitCommit)
 
-	address := os.Getenv(prometheusServerEndpointEnvVar)
-	if address == "" {
-		klog.Fatalf("No address for prometheus set in $%s. Aborting.", prometheusServerEndpointEnvVar)
+	var err error
+	if errorReportingEnabled {
+		err = sentry.Init(sentry.ClientOptions{Release: gitCommit})
+		if err != nil {
+			klog.Infof("Failed to initialize sentry for error reporting")
+		} else {
+			err = errors.SetPanicHandler(handlePanic)
+			if err != nil {
+				klog.Infof("Failed to set panic handler: %s", err)
+			}
+		}
 	}
+
+	address := env.GetPrometheusServerEndpoint()
+	if address == "" {
+		klog.Fatalf("No address for prometheus set in $%s. Aborting.", env.PrometheusServerEndpointEnvVar)
+	}
+
+	queryConcurrency := env.GetMaxQueryConcurrency()
+	klog.Infof("Prometheus/Thanos Client Max Concurrency set to %d", queryConcurrency)
 
 	var LongTimeoutRoundTripper http.RoundTripper = &http.Transport{ // may be necessary for long prometheus queries. TODO: make this configurable
 		Proxy: http.ProxyFromEnvironment,
@@ -895,20 +990,25 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 		Address:      address,
 		RoundTripper: LongTimeoutRoundTripper,
 	}
-	promCli, _ := prometheusClient.NewClient(pc)
+	promCli, _ := prom.NewRateLimitedClient(pc, queryConcurrency, "", "")
 
-	api := prometheusAPI.NewAPI(promCli)
-	_, err := api.Config(context.Background())
-	if err != nil {
-		klog.Fatalf("No valid prometheus config file at %s. Error: %s . Troubleshooting help available at: %s", address, err.Error(), prometheusTroubleshootingEp)
+	m, err := ValidatePrometheus(promCli, false)
+	if err != nil || m.Running == false {
+		if err != nil {
+			klog.Errorf("Failed to query prometheus at %s. Error: %s . Troubleshooting help available at: %s", address, err.Error(), prometheusTroubleshootingEp)
+		} else if m.Running == false {
+			klog.Errorf("Prometheus at %s is not running. Troubleshooting help available at: %s", address, prometheusTroubleshootingEp)
+		}
+		api := prometheusAPI.NewAPI(promCli)
+		_, err = api.Config(context.Background())
+		if err != nil {
+			klog.Infof("No valid prometheus config file at %s. Error: %s . Troubleshooting help available at: %s. Ignore if using cortex/thanos here.", address, err.Error(), prometheusTroubleshootingEp)
+		} else {
+			klog.V(1).Info("Retrieved a prometheus config file from: " + address)
+		}
+	} else {
+		klog.V(1).Info("Success: retrieved the 'up' query against prometheus at: " + address)
 	}
-	klog.V(1).Info("Success: retrieved a prometheus config file from: " + address)
-
-	_, err = ValidatePrometheus(promCli, false)
-	if err != nil {
-		klog.Fatalf("Failed to query prometheus at %s. Error: %s . Troubleshooting help available at: %s", address, err.Error(), prometheusTroubleshootingEp)
-	}
-	klog.V(1).Info("Success: retrieved the 'up' query against prometheus at: " + address)
 
 	// Kubernetes API setup
 	kc, err := rest.InClusterConfig()
@@ -924,7 +1024,7 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 	k8sCache := clustercache.NewKubernetesClusterCache(kubeClientset)
 	k8sCache.Run()
 
-	cloudProviderKey := os.Getenv("CLOUD_PROVIDER_API_KEY")
+	cloudProviderKey := env.GetCloudProviderAPIKey()
 	cloudProvider, err := costAnalyzerCloud.NewProvider(k8sCache, cloudProviderKey)
 	if err != nil {
 		panic(err.Error())
@@ -947,7 +1047,7 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 			}
 		}
 	}
-	kubecostNamespace := os.Getenv("KUBECOST_NAMESPACE")
+	kubecostNamespace := env.GetKubecostNamespace()
 	// We need an initial invocation because the init of the cache has happened before we had access to the provider.
 	configs, err := kubeClientset.CoreV1().ConfigMaps(kubecostNamespace).Get("pricing-configs", metav1.GetOptions{})
 	if err != nil {
@@ -976,22 +1076,22 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 	cpuGv := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_cpu_hourly_cost",
 		Help: "node_cpu_hourly_cost hourly cost for each cpu on this node",
-	}, []string{"instance", "node", "instance_type", "region"})
+	}, []string{"instance", "node", "instance_type", "region", "provider_id"})
 
 	ramGv := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_ram_hourly_cost",
 		Help: "node_ram_hourly_cost hourly cost for each gb of ram on this node",
-	}, []string{"instance", "node", "instance_type", "region"})
+	}, []string{"instance", "node", "instance_type", "region", "provider_id"})
 
 	gpuGv := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_gpu_hourly_cost",
 		Help: "node_gpu_hourly_cost hourly cost for each gpu on this node",
-	}, []string{"instance", "node", "instance_type", "region"})
+	}, []string{"instance", "node", "instance_type", "region", "provider_id"})
 
 	totalGv := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "node_total_hourly_cost",
 		Help: "node_total_hourly_cost Total node cost per hour",
-	}, []string{"instance", "node", "instance_type", "region"})
+	}, []string{"instance", "node", "instance_type", "region", "provider_id"})
 
 	pvGv := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "pv_hourly_cost",
@@ -1017,11 +1117,6 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 		Help: "pod_pvc_allocation Bytes used by a PVC attached to a pod",
 	}, []string{"namespace", "pod", "persistentvolumeclaim", "persistentvolume"})
 
-	ContainerUptimeRecorder := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "container_uptime_seconds",
-		Help: "container_uptime_seconds Seconds a container has been running",
-	}, []string{"namespace", "pod", "container"})
-
 	NetworkZoneEgressRecorder := prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "kubecost_network_zone_egress_cost",
 		Help: "kubecost_network_zone_egress_cost Total cost per GB egress across zones",
@@ -1042,7 +1137,6 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 	prometheus.MustRegister(pvGv)
 	prometheus.MustRegister(RAMAllocation)
 	prometheus.MustRegister(CPUAllocation)
-	prometheus.MustRegister(ContainerUptimeRecorder)
 	prometheus.MustRegister(PVAllocation)
 	prometheus.MustRegister(GPUAllocation)
 	prometheus.MustRegister(NetworkZoneEgressRecorder, NetworkRegionEgressRecorder, NetworkInternetEgressRecorder)
@@ -1072,7 +1166,6 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 		CPUAllocationRecorder:         CPUAllocation,
 		GPUAllocationRecorder:         GPUAllocation,
 		PVAllocationRecorder:          PVAllocation,
-		ContainerUptimeRecorder:       ContainerUptimeRecorder,
 		NetworkZoneEgressRecorder:     NetworkZoneEgressRecorder,
 		NetworkRegionEgressRecorder:   NetworkRegionEgressRecorder,
 		NetworkInternetEgressRecorder: NetworkInternetEgressRecorder,
@@ -1081,8 +1174,8 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 		OutOfClusterCache:             outOfClusterCache,
 	}
 
-	remoteEnabled := os.Getenv(remoteEnabled)
-	if remoteEnabled == "true" {
+	remoteEnabled := env.IsRemoteEnabled()
+	if remoteEnabled {
 		info, err := cloudProvider.ClusterInfo()
 		klog.Infof("Saving cluster  with id:'%s', and name:'%s' to durable storage", info["id"], info["name"])
 		if err != nil {
@@ -1095,8 +1188,9 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 	}
 
 	// Thanos Client
-	if os.Getenv(thanosEnabled) == "true" {
-		thanosUrl := os.Getenv(thanosQueryUrl)
+	if thanos.IsEnabled() {
+		thanosUrl := thanos.QueryURL()
+
 		if thanosUrl != "" {
 			var thanosRT http.RoundTripper = &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
@@ -1111,7 +1205,8 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 				Address:      thanosUrl,
 				RoundTripper: thanosRT,
 			}
-			thanosCli, _ := prometheusClient.NewClient(thanosConfig)
+
+			thanosCli, _ := prom.NewRateLimitedClient(thanosConfig, queryConcurrency, multiclusterDBBasicAuthUsername, multiclusterDBBasicAuthPW)
 
 			_, err = ValidatePrometheus(thanosCli, true)
 			if err != nil {
@@ -1124,7 +1219,7 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 			}
 
 		} else {
-			klog.Infof("Error resolving environment variable: $%s", thanosQueryUrl)
+			klog.Infof("Error resolving environment variable: $%s", env.ThanosQueryUrlEnvVar)
 		}
 	}
 
@@ -1148,8 +1243,8 @@ func Initialize(additionalConfigWatchers ...ConfigWatchers) {
 	Router.GET("/validatePrometheus", A.GetPrometheusMetadata)
 	Router.GET("/managementPlatform", A.ManagementPlatform)
 	Router.GET("/clusterInfo", A.ClusterInfo)
-	Router.GET("/containerUptimes", A.ContainerUptimes)
 	Router.GET("/clusters", managerEndpoints.GetAllClusters)
+	Router.GET("/serviceAccountStatus", A.GetServiceAccountStatus)
 	Router.PUT("/clusters", managerEndpoints.PutCluster)
 	Router.DELETE("/clusters/:id", managerEndpoints.DeleteCluster)
 }

@@ -9,6 +9,9 @@ spec:
     matchLabels:
       app: cost-model
   replicas: 1
+  selector:
+    matchLabels:
+      app: cost-model
   strategy:
     rollingUpdate:
       maxSurge: 1

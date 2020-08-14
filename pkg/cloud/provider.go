@@ -5,21 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
 	"k8s.io/klog"
 
 	"cloud.google.com/go/compute/metadata"
+
 	"github.com/kubecost/cost-model/pkg/clustercache"
+	"github.com/kubecost/cost-model/pkg/env"
 
 	v1 "k8s.io/api/core/v1"
 )
 
-const clusterIDKey = "CLUSTER_ID"
-const remoteEnabled = "REMOTE_WRITE_ENABLED"
-const remotePW = "REMOTE_WRITE_PASSWORD"
-const sqlAddress = "SQL_ADDRESS"
 const authSecretPath = "/var/secrets/service-key.json"
 
 var createTableStatements = []string{
@@ -61,6 +58,7 @@ type Node struct {
 	InstanceType     string                `json:"instanceType,omitempty"`
 	Region           string                `json:"region,omitempty"`
 	Reserved         *ReservedInstanceData `json:"reserved,omitempty"`
+	ProviderID       string                `json:"providerID,omitempty"`
 }
 
 // IsSpot determines whether or not a Node uses spot by usage type
@@ -140,6 +138,7 @@ type CustomPricing struct {
 	AthenaRegion          string            `json:"athenaRegion"`
 	AthenaDatabase        string            `json:"athenaDatabase"`
 	AthenaTable           string            `json:"athenaTable"`
+	MasterPayerARN        string            `json:"masterPayerARN"`
 	BillingDataDataset    string            `json:"billingDataDataset,omitempty"`
 	CustomPricesEnabled   string            `json:"customPricesEnabled"`
 	DefaultIdle           string            `json:"defaultIdle"`
@@ -159,16 +158,27 @@ type CustomPricing struct {
 	ReadOnly              string            `json:"readOnly"`
 }
 
+type ServiceAccountStatus struct {
+	Checks []*ServiceAccountCheck `json:"checks"`
+}
+
+type ServiceAccountCheck struct {
+	Message        string `json:"message"`
+	Status         bool   `json:"status"`
+	AdditionalInfo string `json:additionalInfo`
+}
+
 // Provider represents a k8s provider.
 type Provider interface {
 	ClusterInfo() (map[string]string, error)
+	GetAddresses() ([]byte, error)
 	GetDisks() ([]byte, error)
 	NodePricing(Key) (*Node, error)
 	PVPricing(PVKey) (*PV, error)
 	NetworkPricing() (*Network, error)
 	AllNodePricing() (interface{}, error)
 	DownloadPricingData() error
-	GetKey(map[string]string) Key
+	GetKey(map[string]string, *v1.Node) Key
 	GetPVKey(*v1.PersistentVolume, map[string]string, string) PVKey
 	UpdateConfig(r io.Reader, updateType string) (*CustomPricing, error)
 	UpdateConfigFromConfigMap(map[string]string) (*CustomPricing, error)
@@ -177,6 +187,8 @@ type Provider interface {
 	GetLocalStorageQuery(string, string, bool, bool) string
 	ExternalAllocations(string, string, []string, string, string, bool) ([]*OutOfClusterAllocation, error)
 	ApplyReservedInstancePricing(map[string]*Node)
+	ServiceAccountStatus() *ServiceAccountStatus
+	CombinedDiscountForNode(string, bool, float64, float64) float64
 }
 
 // ClusterName returns the name defined in cluster info, defaulting to the
@@ -184,12 +196,12 @@ type Provider interface {
 func ClusterName(p Provider) string {
 	info, err := p.ClusterInfo()
 	if err != nil {
-		return os.Getenv(clusterIDKey)
+		return env.GetClusterID()
 	}
 
 	name, ok := info["name"]
 	if !ok {
-		return os.Getenv(clusterIDKey)
+		return env.GetClusterID()
 	}
 
 	return name
@@ -229,6 +241,34 @@ func NewCrossClusterProvider(ctype string, overrideConfigPath string, cache clus
 
 // NewProvider looks at the nodespec or provider metadata server to decide which provider to instantiate.
 func NewProvider(cache clustercache.ClusterCache, apiKey string) (Provider, error) {
+	nodes := cache.GetAllNodes()
+	if len(nodes) == 0 {
+		return nil, fmt.Errorf("Could not locate any nodes for cluster.")
+	}
+
+	provider := strings.ToLower(nodes[0].Spec.ProviderID)
+
+	if env.IsUseCSVProvider() {
+		klog.Infof("Using CSV Provider with CSV at %s", env.GetCSVPath())
+		configFileName := ""
+		if metadata.OnGCE() {
+			configFileName = "gcp.json"
+		} else if strings.HasPrefix(provider, "aws") {
+			configFileName = "aws.json"
+		} else if strings.HasPrefix(provider, "azure") {
+			configFileName = "azure.json"
+
+		} else {
+			configFileName = "default.json"
+		}
+		return &CSVProvider{
+			CSVLocation: env.GetCSVPath(),
+			CustomProvider: &CustomProvider{
+				Clientset: cache,
+				Config:    NewProviderConfig(configFileName),
+			},
+		}, nil
+	}
 	if metadata.OnGCE() {
 		klog.V(3).Info("metadata reports we are in GCE")
 		if apiKey == "" {
@@ -241,12 +281,6 @@ func NewProvider(cache clustercache.ClusterCache, apiKey string) (Provider, erro
 		}, nil
 	}
 
-	nodes := cache.GetAllNodes()
-	if len(nodes) == 0 {
-		return nil, fmt.Errorf("Could not locate any nodes for cluster.")
-	}
-
-	provider := strings.ToLower(nodes[0].Spec.ProviderID)
 	if strings.HasPrefix(provider, "aws") {
 		klog.V(2).Info("Found ProviderID starting with \"aws\", using AWS Provider")
 		return &AWS{
@@ -269,8 +303,8 @@ func NewProvider(cache clustercache.ClusterCache, apiKey string) (Provider, erro
 }
 
 func UpdateClusterMeta(cluster_id, cluster_name string) error {
-	pw := os.Getenv(remotePW)
-	address := os.Getenv(sqlAddress)
+	pw := env.GetRemotePW()
+	address := env.GetSQLAddress()
 	connStr := fmt.Sprintf("postgres://postgres:%s@%s:5432?sslmode=disable", pw, address)
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
@@ -286,8 +320,8 @@ func UpdateClusterMeta(cluster_id, cluster_name string) error {
 }
 
 func CreateClusterMeta(cluster_id, cluster_name string) error {
-	pw := os.Getenv(remotePW)
-	address := os.Getenv(sqlAddress)
+	pw := env.GetRemotePW()
+	address := env.GetSQLAddress()
 	connStr := fmt.Sprintf("postgres://postgres:%s@%s:5432?sslmode=disable", pw, address)
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
@@ -309,8 +343,8 @@ func CreateClusterMeta(cluster_id, cluster_name string) error {
 }
 
 func GetClusterMeta(cluster_id string) (string, string, error) {
-	pw := os.Getenv(remotePW)
-	address := os.Getenv(sqlAddress)
+	pw := env.GetRemotePW()
+	address := env.GetSQLAddress()
 	connStr := fmt.Sprintf("postgres://postgres:%s@%s:5432?sslmode=disable", pw, address)
 	db, err := sql.Open("postgres", connStr)
 	defer db.Close()

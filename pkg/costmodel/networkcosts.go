@@ -2,8 +2,9 @@ package costmodel
 
 import (
 	costAnalyzerCloud "github.com/kubecost/cost-model/pkg/cloud"
+	"github.com/kubecost/cost-model/pkg/log"
+	"github.com/kubecost/cost-model/pkg/prom"
 	"github.com/kubecost/cost-model/pkg/util"
-	"k8s.io/klog"
 )
 
 // NetworkUsageVNetworkUsageDataector contains the network usage values for egress network traffic
@@ -26,7 +27,7 @@ type NetworkUsageVector struct {
 
 // GetNetworkUsageData performs a join of the the results of zone, region, and internet usage queries to return a single
 // map containing network costs for each namespace+pod
-func GetNetworkUsageData(zr interface{}, rr interface{}, ir interface{}, defaultClusterID string) (map[string]*NetworkUsageData, error) {
+func GetNetworkUsageData(zr []*prom.QueryResult, rr []*prom.QueryResult, ir []*prom.QueryResult, defaultClusterID string) (map[string]*NetworkUsageData, error) {
 	zoneNetworkMap, err := getNetworkUsage(zr, defaultClusterID)
 	if err != nil {
 		return nil, err
@@ -136,14 +137,10 @@ func GetNetworkCost(usage *NetworkUsageData, cloud costAnalyzerCloud.Provider) (
 	return results, nil
 }
 
-func getNetworkUsage(qr interface{}, defaultClusterID string) (map[string]*NetworkUsageVector, error) {
+func getNetworkUsage(qrs []*prom.QueryResult, defaultClusterID string) (map[string]*NetworkUsageVector, error) {
 	ncdmap := make(map[string]*NetworkUsageVector)
-	result, err := NewQueryResults(qr)
-	if err != nil {
-		return nil, err
-	}
 
-	for _, val := range result {
+	for _, val := range qrs {
 		podName, err := val.GetString("pod_name")
 		if err != nil {
 			return nil, err
@@ -156,7 +153,7 @@ func getNetworkUsage(qr interface{}, defaultClusterID string) (map[string]*Netwo
 
 		clusterID, err := val.GetString("cluster_id")
 		if clusterID == "" {
-			klog.V(4).Info("Prometheus vector does not have cluster id")
+			log.Debugf("Prometheus vector does not have cluster id")
 			clusterID = defaultClusterID
 		}
 

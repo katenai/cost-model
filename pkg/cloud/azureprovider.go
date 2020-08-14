@@ -6,13 +6,13 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 
 	"github.com/kubecost/cost-model/pkg/clustercache"
+	"github.com/kubecost/cost-model/pkg/env"
 	"github.com/kubecost/cost-model/pkg/util"
 
 	"github.com/Azure/azure-sdk-for-go/services/compute/mgmt/2017-09-01/skus"
@@ -285,7 +285,7 @@ func (az *Azure) loadAzureAuthSecret(force bool) (*AzureServiceKey, error) {
 	return azureSecret, nil
 }
 
-func (az *Azure) GetKey(labels map[string]string) Key {
+func (az *Azure) GetKey(labels map[string]string, n *v1.Node) Key {
 	cfg, err := az.GetConfig()
 	if err != nil {
 		klog.Infof("Error loading azure custom pricing information")
@@ -663,16 +663,16 @@ func (key *azurePvKey) Features() string {
 	return key.DefaultRegion + "," + storageClass
 }
 
+func (*Azure) GetAddresses() ([]byte, error) {
+	return nil, nil
+}
+
 func (*Azure) GetDisks() ([]byte, error) {
 	return nil, nil
 }
 
 func (az *Azure) ClusterInfo() (map[string]string, error) {
-	remote := os.Getenv(remoteEnabled)
-	remoteEnabled := false
-	if os.Getenv(remote) == "true" {
-		remoteEnabled = true
-	}
+	remoteEnabled := env.IsRemoteEnabled()
 
 	m := make(map[string]string)
 	m["name"] = "Azure Cluster #1"
@@ -685,7 +685,7 @@ func (az *Azure) ClusterInfo() (map[string]string, error) {
 	}
 	m["provider"] = "azure"
 	m["remoteReadEnabled"] = strconv.FormatBool(remoteEnabled)
-	m["id"] = os.Getenv(clusterIDKey)
+	m["id"] = env.GetClusterID()
 	return m, nil
 
 }
@@ -721,9 +721,8 @@ func (az *Azure) UpdateConfig(r io.Reader, updateType string) (*CustomPricing, e
 			}
 		}
 
-		remoteEnabled := os.Getenv(remoteEnabled)
-		if remoteEnabled == "true" {
-			err := UpdateClusterMeta(os.Getenv(clusterIDKey), c.ClusterName)
+		if env.IsRemoteEnabled() {
+			err := UpdateClusterMeta(env.GetClusterID(), c.ClusterName)
 			if err != nil {
 				return err
 			}
@@ -774,4 +773,14 @@ func (az *Azure) PVPricing(pvk PVKey) (*PV, error) {
 
 func (az *Azure) GetLocalStorageQuery(window, offset string, rate bool, used bool) string {
 	return ""
+}
+
+func (az *Azure) ServiceAccountStatus() *ServiceAccountStatus {
+	return &ServiceAccountStatus{
+		Checks: []*ServiceAccountCheck{},
+	}
+}
+
+func (az *Azure) CombinedDiscountForNode(instanceType string, isPreemptible bool, defaultDiscount, negotiatedDiscount float64) float64 {
+	return 1.0 - ((1.0 - defaultDiscount) * (1.0 - negotiatedDiscount))
 }

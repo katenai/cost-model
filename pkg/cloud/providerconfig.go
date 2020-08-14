@@ -4,11 +4,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/kubecost/cost-model/pkg/env"
 	"github.com/kubecost/cost-model/pkg/util"
 
 	"k8s.io/klog"
@@ -138,6 +139,14 @@ func (pc *ProviderConfig) UpdateFromMap(a map[string]string) (*CustomPricing, er
 		for k, v := range a {
 			// Just so we consistently supply / receive the same values, uppercase the first letter.
 			kUpper := strings.Title(k)
+			if kUpper == "CPU" || kUpper == "SpotCPU" || kUpper == "RAM" || kUpper == "SpotRAM" || kUpper == "GPU" || kUpper == "Storage" {
+				val, err := strconv.ParseFloat(v, 64)
+				if err != nil {
+					return fmt.Errorf("Unable to parse CPU from string to float: %s", err.Error())
+				}
+				v = fmt.Sprintf("%f", val/730)
+			}
+
 			err := SetCustomPricingField(c, kUpper, v)
 			if err != nil {
 				return err
@@ -201,9 +210,6 @@ func fileExists(filename string) (bool, error) {
 
 // Returns the configuration directory concatenated with a specific config file name
 func configPathFor(filename string) string {
-	path := os.Getenv("CONFIG_PATH")
-	if path == "" {
-		path = "/models/"
-	}
+	path := env.GetConfigPathWithDefault("/models/")
 	return path + filename
 }
